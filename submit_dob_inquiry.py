@@ -11,16 +11,19 @@ from __future__ import annotations
 
 import argparse
 import html
-import http.cookiejar
 import json
 import re
 import sys
 import time
 import uuid
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
+
+try:
+    from curl_cffi import requests as curl_requests
+    from curl_cffi.requests.exceptions import RequestException
+except ModuleNotFoundError:
+    curl_requests = None
+    RequestException = Exception
 
 
 BASE = "https://bnfaq-support.channel.or.jp"
@@ -42,8 +45,14 @@ def compact(text: str) -> str:
     return " ".join(str(text or "").split())
 
 
+def make_session() -> curl_requests.Session:
+    if curl_requests is None:
+        die("Missing curl_cffi. Install with: python3 -m pip install curl_cffi")
+    return curl_requests.Session(default_headers=False, impersonate="chrome121")
+
+
 def request(
-    opener: urllib.request.OpenerDirector,
+    session: curl_requests.Session,
     method: str,
     url: str,
     *,
@@ -51,30 +60,36 @@ def request(
     headers: dict[str, str] | None = None,
     timeout: int = 45,
 ) -> tuple[int, str, dict[str, str], bytes]:
-    req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
     try:
-        with opener.open(req, timeout=timeout) as resp:
-            return resp.status, resp.geturl(), dict(resp.headers), resp.read()
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.geturl(), dict(exc.headers), exc.read()
+        resp = session.request(
+            method=method,
+            url=url,
+            data=data,
+            headers=headers or {},
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        return resp.status_code, str(resp.url), dict(resp.headers), resp.content
+    except RequestException as exc:
+        die(f"HTTP {method} {url} failed: {type(exc).__name__}: {exc}")
     except Exception as exc:
         die(f"HTTP {method} {url} failed: {type(exc).__name__}: {exc}")
 
 
 def text_response(raw: bytes, headers: dict[str, str]) -> str:
-    content_type = headers.get("Content-Type", "")
+    content_type = next((value for key, value in headers.items() if key.lower() == "content-type"), "")
     match = re.search(r"charset=([^;]+)", content_type, re.I)
     encoding = match.group(1).strip() if match else "utf-8"
     return raw.decode(encoding, errors="replace")
 
 
-def load_input_page(opener: urllib.request.OpenerDirector) -> tuple[str, dict]:
+def load_input_page(session: curl_requests.Session) -> tuple[str, dict]:
     headers = {
         "User-Agent": UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9,ja;q=0.8",
     }
-    status, final_url, resp_headers, raw = request(opener, "GET", INPUT_URL, headers=headers)
+    status, final_url, resp_headers, raw = request(session, "GET", INPUT_URL, headers=headers)
     body = text_response(raw, resp_headers)
     if status != 200:
         die(f"GET input returned HTTP {status}: {compact(body)[:300]}")
@@ -107,7 +122,7 @@ def api_headers(csrf: str, referer: str, *, content_type: str) -> dict[str, str]
 
 
 def post_json(
-    opener: urllib.request.OpenerDirector,
+    session: curl_requests.Session,
     url: str,
     csrf: str,
     referer: str,
@@ -115,7 +130,7 @@ def post_json(
 ) -> tuple[int, dict | str]:
     raw_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     status, _, resp_headers, raw = request(
-        opener,
+        session,
         "POST",
         url,
         data=raw_payload,
@@ -146,7 +161,7 @@ def multipart_payload(items: dict) -> tuple[bytes, str]:
 
 
 def post_multipart(
-    opener: urllib.request.OpenerDirector,
+    session: curl_requests.Session,
     url: str,
     csrf: str,
     referer: str,
@@ -154,7 +169,7 @@ def post_multipart(
 ) -> tuple[int, dict | str]:
     body, boundary = multipart_payload(payload)
     status, _, resp_headers, raw = request(
-        opener,
+        session,
         "POST",
         url,
         data=body,
@@ -287,11 +302,10 @@ def main() -> int:
     out_dir = Path(args.out_dir).expanduser() / f"{stamp}_{args.email.replace('@', '_at_')}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    session = make_session()
 
     print("[1/5] GET input page...")
-    input_html, props = load_input_page(opener)
+    input_html, props = load_input_page(session)
     (out_dir / "01_input.html").write_text(input_html, encoding="utf-8")
     write_json(out_dir / "01_input_props.json", props)
     csrf = props["_csrf"]
@@ -301,7 +315,7 @@ def main() -> int:
     confirm_url = routes.get("inquiry_confirm") or f"{BASE}/api/inquiry/www_sup/confirm"
 
     print("[2/5] POST search_form...")
-    status, search_data = post_json(opener, search_url, csrf, props["_input_url"], {"category_id": DOB_CATEGORY_ID})
+    status, search_data = post_json(session, search_url, csrf, props["_input_url"], {"category_id": DOB_CATEGORY_ID})
     write_json(out_dir / "02_search_form.json", search_data)
     if status != 200:
         die(f"search_form returned HTTP {status}: {search_data}")
@@ -310,7 +324,7 @@ def main() -> int:
     write_json(out_dir / "03_payload_confirm.json", payload)
 
     print("[3/5] POST confirm...")
-    status, confirm_data = post_multipart(opener, confirm_url, csrf, props["_input_url"], payload)
+    status, confirm_data = post_multipart(session, confirm_url, csrf, props["_input_url"], payload)
     write_json(out_dir / "04_confirm_response.json", confirm_data)
     if status != 200 or not isinstance(confirm_data, dict) or not confirm_data.get("location"):
         die(f"confirm returned HTTP {status}: {confirm_data}")
@@ -320,7 +334,7 @@ def main() -> int:
 
     print("[4/5] GET confirm page...")
     status, _, resp_headers, raw = request(
-        opener,
+        session,
         "GET",
         confirm_location,
         headers={
@@ -350,7 +364,7 @@ def main() -> int:
     save_input = confirm_props.get("input") or payload
     # The browser stores folder_id/files from the confirm page as already-stringified
     # values. Sending them back exactly as exposed by confirm props matches the Vue flow.
-    status, save_data = post_multipart(opener, save_url, csrf, confirm_location, save_input)
+    status, save_data = post_multipart(session, save_url, csrf, confirm_location, save_input)
     write_json(out_dir / "06_save_response.json", save_data)
     if status != 200 or not isinstance(save_data, dict) or not save_data.get("location"):
         die(f"save returned HTTP {status}: {save_data}")
@@ -358,7 +372,7 @@ def main() -> int:
     done_location = str(save_data["location"])
     print(f"      done location: {done_location}")
     status, _, resp_headers, raw = request(
-        opener,
+        session,
         "GET",
         done_location,
         headers={"User-Agent": UA, "Referer": confirm_location},

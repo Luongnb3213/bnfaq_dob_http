@@ -16,12 +16,17 @@ import json
 import re
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from http.cookiejar import Cookie
 from pathlib import Path
 from typing import Any
+
+try:
+    from curl_cffi import requests as curl_requests
+    from curl_cffi.requests.exceptions import RequestException
+except ModuleNotFoundError:
+    curl_requests = None
+    RequestException = Exception
 
 
 ACCOUNT_BASE = "https://account.bandainamcoid.com"
@@ -52,14 +57,20 @@ def compact(text: Any) -> str:
 
 
 def text_response(raw: bytes, headers: dict[str, str]) -> str:
-    content_type = headers.get("Content-Type", "")
+    content_type = next((value for key, value in headers.items() if key.lower() == "content-type"), "")
     match = re.search(r"charset=([^;]+)", content_type, re.I)
     encoding = match.group(1).strip() if match else "utf-8"
     return raw.decode(encoding, errors="replace")
 
 
+def make_session() -> curl_requests.Session:
+    if curl_requests is None:
+        die("Missing curl_cffi. Install with: python3 -m pip install curl_cffi")
+    return curl_requests.Session(default_headers=False, impersonate="chrome121")
+
+
 def request(
-    opener: urllib.request.OpenerDirector,
+    session: curl_requests.Session,
     method: str,
     url: str,
     *,
@@ -67,12 +78,18 @@ def request(
     headers: dict[str, str] | None = None,
     timeout: int = 45,
 ) -> tuple[int, str, dict[str, str], bytes]:
-    req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
     try:
-        with opener.open(req, timeout=timeout) as resp:
-            return resp.status, resp.geturl(), dict(resp.headers), resp.read()
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.geturl(), dict(exc.headers), exc.read()
+        resp = session.request(
+            method=method,
+            url=url,
+            data=data,
+            headers=headers or {},
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        return resp.status_code, str(resp.url), dict(resp.headers), resp.content
+    except RequestException as exc:
+        die(f"HTTP {method} {url} failed: {type(exc).__name__}: {exc}")
     except Exception as exc:
         die(f"HTTP {method} {url} failed: {type(exc).__name__}: {exc}")
 
@@ -183,7 +200,7 @@ def account_cookie_json(jar: http.cookiejar.CookieJar | None = None) -> str:
 
 
 def get_user_index(
-    opener: urllib.request.OpenerDirector,
+    session: curl_requests.Session,
     jar: http.cookiejar.CookieJar,
 ) -> tuple[int, dict[str, Any]]:
     params = {
@@ -194,11 +211,11 @@ def get_user_index(
         "backto": "https://www.bandainamcoid.com/",
     }
     url = f"{API_BASE}/v3/user/index?{qs(params)}"
-    status, _, headers, raw = request(opener, "GET", url, headers=common_headers())
+    status, _, headers, raw = request(session, "GET", url, headers=common_headers())
     return status, parse_json(raw, headers)
 
 
-def login_init(opener: urllib.request.OpenerDirector, jar: http.cookiejar.CookieJar) -> tuple[int, dict[str, Any]]:
+def login_init(session: curl_requests.Session, jar: http.cookiejar.CookieJar) -> tuple[int, dict[str, Any]]:
     params = {
         "client_id": "idportal",
         "redirect_uri": USER_PAGE_URL,
@@ -216,7 +233,7 @@ def login_init(opener: urllib.request.OpenerDirector, jar: http.cookiejar.Cookie
     }
     url = f"{API_BASE}/v3/login/init?{qs(params)}"
     status, _, headers, raw = request(
-        opener,
+        session,
         "GET",
         url,
         headers=common_headers(f"{LOGIN_PAGE_URL}?client_id=idportal&redirect_uri={urllib.parse.quote(USER_PAGE_URL, safe='')}"),
@@ -227,7 +244,7 @@ def login_init(opener: urllib.request.OpenerDirector, jar: http.cookiejar.Cookie
 
 
 def login_idpw(
-    opener: urllib.request.OpenerDirector,
+    session: curl_requests.Session,
     jar: http.cookiejar.CookieJar,
     email: str,
     password: str,
@@ -248,7 +265,7 @@ def login_idpw(
     headers = common_headers(f"{LOGIN_PAGE_URL}?client_id=idportal&redirect_uri={urllib.parse.quote(USER_PAGE_URL, safe='')}")
     headers["Content-Type"] = "application/x-www-form-urlencoded;charset=UTF-8"
     status, _, resp_headers, raw = request(
-        opener,
+        session,
         "POST",
         f"{API_BASE}/v3/login/idpw",
         data=body,
@@ -260,7 +277,7 @@ def login_idpw(
 
 
 def passkey_info(
-    opener: urllib.request.OpenerDirector,
+    session: curl_requests.Session,
     jar: http.cookiejar.CookieJar,
     redirect_url: str,
 ) -> tuple[int, dict[str, Any]]:
@@ -276,14 +293,14 @@ def passkey_info(
         "cookie": account_cookie_json(jar),
     }
     url = f"{API_BASE}/v3/passkey/info?{qs(params)}"
-    status, _, headers, raw = request(opener, "GET", url, headers=common_headers(redirect_url))
+    status, _, headers, raw = request(session, "GET", url, headers=common_headers(redirect_url))
     data = parse_json(raw, headers)
     apply_cookie_instructions(jar, data)
     return status, data
 
 
 def reauth_init(
-    opener: urllib.request.OpenerDirector,
+    session: curl_requests.Session,
     jar: http.cookiejar.CookieJar,
     reauth_url: str,
 ) -> tuple[int, dict[str, Any]]:
@@ -297,14 +314,14 @@ def reauth_init(
         "cookie": account_cookie_json(jar),
     }
     url = f"{API_BASE}/v3/reauth/init?{qs(params)}"
-    status, _, headers, raw = request(opener, "GET", url, headers=common_headers(reauth_url))
+    status, _, headers, raw = request(session, "GET", url, headers=common_headers(reauth_url))
     data = parse_json(raw, headers)
     apply_cookie_instructions(jar, data)
     return status, data
 
 
 def reauth_idpw(
-    opener: urllib.request.OpenerDirector,
+    session: curl_requests.Session,
     jar: http.cookiejar.CookieJar,
     reauth_url: str,
     password: str,
@@ -323,7 +340,7 @@ def reauth_idpw(
     headers = common_headers(reauth_url)
     headers["Content-Type"] = "application/x-www-form-urlencoded;charset=UTF-8"
     status, _, resp_headers, raw = request(
-        opener,
+        session,
         "POST",
         f"{API_BASE}/v3/reauth/idpw",
         data=body,
@@ -439,15 +456,15 @@ def main() -> int:
     out_dir = Path(args.out_dir).expanduser() / f"{stamp}_{safe_name(args.email)}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    session = make_session()
+    jar = session.cookies.jar
     set_cookie_everywhere(jar, "language", "ja")
     if args.cookie_header:
         apply_cookie_header(jar, args.cookie_header)
 
     print("[1/6] GET user page shell...")
     status, final_url, headers, raw = request(
-        opener,
+        session,
         "GET",
         USER_PAGE_URL,
         headers={
@@ -466,13 +483,13 @@ def main() -> int:
         write_json(out_dir / "02_cookie_mode.json", {"mode": "cookie_header"})
     else:
         print("[2/6] GET login init...")
-        status, init_data = login_init(opener, jar)
+        status, init_data = login_init(session, jar)
         write_json(out_dir / "02_login_init.json", init_data)
         if status != 200:
             die(f"login init returned HTTP {status}: {init_data}")
 
         print("[3/6] POST login id/password...")
-        status, login_data = login_idpw(opener, jar, args.email, args.password)
+        status, login_data = login_idpw(session, jar, args.email, args.password)
         write_json(out_dir / "03_login_idpw.json", login_data)
         if status != 200:
             die(f"login idpw returned HTTP {status}: {login_data}")
@@ -488,7 +505,7 @@ def main() -> int:
         if "passkeyInfo.html" in redirect_url:
             print("[4/6] GET passkey info...")
             status, _, passkey_headers, passkey_raw = request(
-                opener,
+                session,
                 "GET",
                 redirect_url,
                 headers={
@@ -501,7 +518,7 @@ def main() -> int:
             (out_dir / "04_passkey_page.html").write_bytes(passkey_raw)
             if status != 200:
                 die(f"passkey page returned HTTP {status}: {redirect_url}")
-            status, passkey_data = passkey_info(opener, jar, redirect_url)
+            status, passkey_data = passkey_info(session, jar, redirect_url)
             write_json(out_dir / "05_passkey_info.json", passkey_data)
             if status != 200:
                 die(f"passkey info returned HTTP {status}: {passkey_data}")
@@ -512,7 +529,7 @@ def main() -> int:
     reauth_profile_data: dict[str, Any] = {}
 
     print("[5/6] GET user index...")
-    status, profile_data = get_user_index(opener, jar)
+    status, profile_data = get_user_index(session, jar)
     write_json(out_dir / "04_user_index.json", profile_data)
     if status != 200:
         die(f"user index returned HTTP {status}: {profile_data}")
@@ -521,7 +538,7 @@ def main() -> int:
     if args.password and "reauth.html" in reauth_url:
         print("[5b/6] Reauth password branch...")
         status, _, _, reauth_page_raw = request(
-            opener,
+            session,
             "GET",
             reauth_url,
             headers={
@@ -535,13 +552,13 @@ def main() -> int:
         if status != 200:
             die(f"reauth page returned HTTP {status}: {reauth_url}")
 
-        status, reauth_data = reauth_init(opener, jar, reauth_url)
+        status, reauth_data = reauth_init(session, jar, reauth_url)
         write_json(out_dir / "06_reauth_init.json", reauth_data)
         if status != 200:
             die(f"reauth init returned HTTP {status}: {reauth_data}")
         reauth_profile_data = reauth_data
 
-        status, reauth_done = reauth_idpw(opener, jar, reauth_url, args.password)
+        status, reauth_done = reauth_idpw(session, jar, reauth_url, args.password)
         write_json(out_dir / "07_reauth_idpw.json", reauth_done)
         if status != 200:
             die(f"reauth idpw returned HTTP {status}: {reauth_done}")
@@ -553,7 +570,7 @@ def main() -> int:
             print(f"Artifacts: {out_dir}")
             return 2
 
-        status, profile_data = get_user_index(opener, jar)
+        status, profile_data = get_user_index(session, jar)
         write_json(out_dir / "08_user_index_after_reauth.json", profile_data)
         if status != 200:
             die(f"user index after reauth returned HTTP {status}: {profile_data}")
